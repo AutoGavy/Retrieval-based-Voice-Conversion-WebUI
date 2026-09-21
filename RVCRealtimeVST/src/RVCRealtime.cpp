@@ -2,10 +2,13 @@
 #include "IPlug_include_in_plug_src.h"
 #include "IPlugPaths.h"
 #include "IControls.h"
+#include "RealtimePolicy.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <charconv>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -21,9 +24,19 @@ const IColor kHeaderColor = IColor(255, 235, 234, 228);
 const IColor kText = IColor(255, 233, 232, 226);
 const IColor kMuted = IColor(255, 152, 155, 155);
 const IColor kAccent = IColor(255, 41, 151, 126);
+const IColor kToggleOn = IColor(255, 190, 42, 48);
 const IColor kAmber = IColor(255, 230, 160, 48);
 
 enum class PathRow { RvcRoot, Python, Model, Index };
+
+// Stable INI keys, independent of display labels and translated UI text.
+// Engine state remains part of host state only, never a new-instance default.
+constexpr const wchar_t* kParameterSettingKeys[] = {
+  nullptr, L"Pitch", L"Formant", L"IndexRate", L"RmsMix", L"Threshold",
+  L"BlockMs", L"CrossfadeMs", L"ContextMs", L"F0Method", L"Mix",
+  L"OutputGain", L"GpuPriority", L"MaxLatencyMs"
+};
+static_assert(sizeof(kParameterSettingKeys) / sizeof(kParameterSettingKeys[0]) == kNumParams);
 
 std::wstring SettingsFilePath(const bool createDirectory)
 {
@@ -37,11 +50,11 @@ std::wstring SettingsFilePath(const bool createDirectory)
   return result;
 }
 
-std::string ReadSetting(const wchar_t* key)
+std::string ReadSetting(const wchar_t* key, const wchar_t* section = L"Paths")
 {
   const std::wstring settingsPath = SettingsFilePath(false);
   std::vector<wchar_t> value(32768, L'\0');
-  GetPrivateProfileStringW(L"Paths", key, L"", value.data(), static_cast<DWORD>(value.size()), settingsPath.c_str());
+  GetPrivateProfileStringW(section, key, L"", value.data(), static_cast<DWORD>(value.size()), settingsPath.c_str());
   return UTF16AsUTF8(value.data()).Get();
 }
 
@@ -156,6 +169,9 @@ RVCRealtime::RVCRealtime(const InstanceInfo& info)
   GetParam(kF0Method)->InitEnum("F0 Method", 0, {"RMVPE", "FCPE", "PM"});
   GetParam(kDryWet)->InitDouble("Mix", 100.0, 0.0, 100.0, 0.1, "%");
   GetParam(kOutputGain)->InitDouble("Output", 0.0, -18.0, 12.0, 0.1, "dB");
+  GetParam(kGpuPriority)->InitBool("GPU Priority", true);
+  GetParam(kMaxLatencyMs)->InitInt("Max Acceptable Latency", static_cast<int>(rvc::kDefaultMaxLatencyMs),
+                                  static_cast<int>(rvc::kMinMaxLatencyMs), static_cast<int>(rvc::kMaxMaxLatencyMs), "ms");
 
   LoadUserConfiguration();
   if (mPythonPath.GetLength() == 0 && mRvcRoot.GetLength() > 0) {
@@ -186,6 +202,9 @@ RVCRealtime::RVCRealtime(const InstanceInfo& info)
     graphics->AttachPanelBackground(kBackground);
     graphics->LoadFont("Roboto-Regular", ROBOTO_FN);
     const IVStyle style = MakeStyle();
+    // Toggle ON uses kPR as its fill, not its text color. Keep the value
+    // light on a red background so ON remains readable in both toggles.
+    const IVStyle toggleStyle = style.WithColor(kPR, kToggleOn);
     const IRECT bounds = graphics->GetBounds();
 
     // Header
@@ -196,7 +215,7 @@ RVCRealtime::RVCRealtime(const InstanceInfo& info)
                                               IText(12.f, IColor(255, 85, 89, 90), "Roboto-Regular", EAlign::Near)));
     graphics->AttachControl(new ITextControl(IRECT(560, 16, 750, 42), "ENGINE OFF",
                                               IText(14.f, IColor(255, 80, 84, 86), "Roboto-Regular", EAlign::Far)), kCtrlStatus);
-    graphics->AttachControl(new ITextControl(IRECT(560, 42, 750, 66), "0 ms / 0 drop",
+    graphics->AttachControl(new ITextControl(IRECT(420, 42, 750, 66), "0 infer / 0 age ms / 0 drop",
                                               IText(12.f, IColor(255, 100, 104, 105), "Roboto-Regular", EAlign::Far)), kCtrlPerformance);
 
     // Runtime and model paths
@@ -253,8 +272,19 @@ RVCRealtime::RVCRealtime(const InstanceInfo& info)
                                                    sliders[i].label, style, true, EDirection::Horizontal));
     }
 
+    // Overload controls. GPU priority is a request, never a reserved GPU quota.
+    graphics->AttachControl(new IPanelControl(IRECT(30, 518, 560, 572), kPanel));
+    graphics->AttachControl(new RVCSliderControl(IRECT(38, 522, 552, 568), kMaxLatencyMs,
+                                                 "MAX ACCEPTABLE LATENCY", style, true, EDirection::Horizontal));
+    graphics->AttachControl(new IVToggleControl(IRECT(580, 522, 750, 568), kGpuPriority,
+                                                "GPU PRIORITY", toggleStyle));
+    graphics->AttachControl(new ITextControl(IRECT(30, 578, 750, 601), "GPU priority: pending",
+                                              IText(12.f, kMuted, "Roboto-Regular", EAlign::Near)), kCtrlGpuPriority);
+    graphics->AttachControl(new ITextControl(IRECT(30, 602, 750, 625), "Latency budget covers plugin queues + inference only",
+                                              IText(12.f, kAmber, "Roboto-Regular", EAlign::Near)), kCtrlLatencyHint);
+
     // Bottom row: F0 method, output gain, engine toggle — one shared baseline
-    const float bottomY = 566.f, bottomHeight = 44.f;
+    const float bottomY = 640.f, bottomHeight = 44.f;
     graphics->AttachControl(new ITextControl(IRECT(30, bottomY, 100, bottomY + bottomHeight), "F0 METHOD",
                                               IText(12.f, kMuted, "Roboto-Regular", EAlign::Near)));
     graphics->AttachControl(new IVMenuButtonControl(IRECT(104, bottomY, 236, bottomY + bottomHeight), kF0Method,
@@ -263,7 +293,7 @@ RVCRealtime::RVCRealtime(const InstanceInfo& info)
     graphics->AttachControl(new RVCSliderControl(IRECT(266, bottomY + 2, 552, bottomY + bottomHeight - 2), kOutputGain,
                                                  "OUTPUT", style, true, EDirection::Horizontal));
     graphics->AttachControl(new IVToggleControl(IRECT(600, bottomY, 750, bottomY + bottomHeight), kEngine,
-                                                "ENGINE", style));
+                                                "ENGINE", toggleStyle));
   };
 #endif
 }
@@ -306,7 +336,6 @@ void RVCRealtime::OnParamChange(const int paramIdx)
         std::lock_guard<std::mutex> lock(mStateMutex);
         mValidationMessage.Set("");
       }
-      SaveUserConfiguration();
       mWorker.setEnabled(true);
     } else {
       mWorker.setEnabled(false);
@@ -394,6 +423,9 @@ void RVCRealtime::ProcessBlock(sample** inputs, sample** outputs, const int nFra
 
 void RVCRealtime::OnIdle()
 {
+  // Runs even with the editor closed. Never write settings in ProcessBlock or
+  // OnParamChange, since those can be called on the real-time audio thread.
+  FlushParameterSettings();
 #if IPLUG_EDITOR
   if (GetUI() == nullptr)
     return;
@@ -407,7 +439,16 @@ void RVCRealtime::OnIdle()
   if (auto* detail = GetUI()->GetControlWithTag(kCtrlStatusDetail))
     detail->As<ITextControl>()->SetStr(validationMessage.empty() ? mWorker.statusText().c_str() : validationMessage.c_str());
   if (auto* performance = GetUI()->GetControlWithTag(kCtrlPerformance))
-    performance->As<ITextControl>()->SetStrFmt(80, "%.0f ms / %.0f drop", mWorker.inferMs(), mWorker.droppedBlocks());
+    performance->As<ITextControl>()->SetStrFmt(100, "%.0f infer / %.0f age ms / %.0f drop",
+                                             mWorker.inferMs(), mWorker.audioAgeMs(), mWorker.droppedBlocks());
+  if (auto* gpu = GetUI()->GetControlWithTag(kCtrlGpuPriority))
+    gpu->As<ITextControl>()->SetStr(mWorker.gpuPriorityText().c_str());
+  if (auto* hint = GetUI()->GetControlWithTag(kCtrlLatencyHint))
+    hint->As<ITextControl>()->SetStr(mParameterSaveFailed
+      ? "Could not auto-save parameters to settings.ini; check folder permissions"
+      : GetParam(kMaxLatencyMs)->Value() < GetParam(kBlockMs)->Value() * 2.0
+      ? "Budget is tight relative to BLOCK: audio may be dropped; lower BLOCK or raise the budget"
+      : "Latency budget covers plugin queues + inference only; expired audio is dropped, not replayed");
 #endif
 }
 
@@ -415,6 +456,68 @@ void RVCRealtime::OnUIOpen()
 {
   Plugin::OnUIOpen(); // pushes current param values to the UI controls
   UpdateFileLabels();
+}
+
+RVCRealtime::~RVCRealtime()
+{
+  FlushParameterSettings(true);
+}
+
+void RVCRealtime::OnUIClose()
+{
+  FlushParameterSettings(true);
+  Plugin::OnUIClose();
+}
+
+void RVCRealtime::OnParamChangeUI(const int paramIdx, const EParamSource source)
+{
+  Plugin::OnParamChangeUI(paramIdx, source);
+  if (paramIdx < 0 || paramIdx >= kNumParams)
+    return;
+#if defined(VST3_API)
+  // iPlug's VST3 controller initially uses factory defaults. Publish the values
+  // loaded from settings before the host queries its controller parameters.
+  if (source == kReset)
+    SetVST3ParamNormalized(paramIdx, GetParam(paramIdx)->GetNormalized());
+#endif
+  // Save deliberate edits from the plugin controls only. Host automation,
+  // startup/reset and preset recall must not overwrite global user defaults.
+  if (source != kUI)
+    return;
+  if (paramIdx == kEngine) {
+    if (GetParam(kEngine)->Bool())
+      SaveUserConfiguration();
+    return;
+  }
+  mPendingParameterValues[paramIdx] = GetParam(paramIdx)->Value();
+  mPendingParameterMask |= uint32_t{1} << paramIdx;
+  mParameterSaveDue = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+}
+
+void RVCRealtime::FlushParameterSettings(const bool force)
+{
+  if (mPendingParameterMask == 0 || (!force && std::chrono::steady_clock::now() < mParameterSaveDue))
+    return;
+  const std::wstring settingsPath = SettingsFilePath(true);
+  for (int i = 1; i < kNumParams; ++i) {
+    const uint32_t bit = uint32_t{1} << i;
+    if ((mPendingParameterMask & bit) == 0)
+      continue;
+    char value[64] {};
+    // Locale-independent, round-trip-safe storage for fractional parameters.
+    const auto converted = std::to_chars(value, value + sizeof(value) - 1, mPendingParameterValues[i],
+                                         std::chars_format::general, std::numeric_limits<double>::max_digits10);
+    if (converted.ec != std::errc{})
+      continue;
+    const UTF8AsUTF16 valueWide(value);
+    if (WritePrivateProfileStringW(L"Parameters", kParameterSettingKeys[i], valueWide.Get(), settingsPath.c_str()))
+      mPendingParameterMask &= ~bit;
+  }
+  mParameterSaveFailed = mPendingParameterMask != 0;
+  // Retry a failed save without writing every UI frame. Save only edited keys,
+  // so another plugin instance's untouched settings are not overwritten.
+  if (mParameterSaveFailed)
+    mParameterSaveDue = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 }
 
 bool RVCRealtime::SerializeState(IByteChunk& chunk) const
@@ -436,6 +539,10 @@ int RVCRealtime::UnserializeState(const IByteChunk& chunk, int startPos)
   startPos = chunk.GetStr(python, startPos);
   if (startPos < 0)
     return startPos;
+  constexpr int legacyParamBytes = 12 * static_cast<int>(sizeof(double));
+  const int paramBytes = chunk.Size() - startPos;
+  if (paramBytes != legacyParamBytes && paramBytes != kNumParams * static_cast<int>(sizeof(double)))
+    return -1;
   {
     std::lock_guard<std::mutex> lock(mStateMutex);
     mModelPath.Set(model.Get());
@@ -447,7 +554,21 @@ int RVCRealtime::UnserializeState(const IByteChunk& chunk, int startPos)
   mWorker.setPath(rvc::kStateIndexPath, index.Get());
   mWorker.setPath(rvc::kStateRvcRoot, root.Get());
   mWorker.setPath(rvc::kStatePythonPath, python.Get());
-  startPos = UnserializeParams(chunk, startPos);
+  if (paramBytes == legacyParamBytes) {
+    // Existing host sessions contain the original twelve parameters. Append
+    // defaults without renumbering any old automation IDs or rejecting the state.
+    IByteChunk upgraded;
+    upgraded.PutBytes(chunk.GetData() + startPos, legacyParamBytes);
+    const double gpuPriority = 1.0;
+    const double maxLatency = rvc::kDefaultMaxLatencyMs;
+    upgraded.Put(&gpuPriority);
+    upgraded.Put(&maxLatency);
+    if (UnserializeParams(upgraded, 0) < 0)
+      return -1;
+    startPos += legacyParamBytes;
+  } else {
+    startPos = UnserializeParams(chunk, startPos);
+  }
   SyncParametersToWorker();
   UpdateFileLabels();
   return startPos;
@@ -626,6 +747,15 @@ void RVCRealtime::LoadUserConfiguration()
   if (!python.empty()) mPythonPath.Set(python.c_str());
   if (!model.empty()) mModelPath.Set(model.c_str());
   if (!index.empty()) mIndexPath.Set(index.c_str());
+  for (int i = 1; i < kNumParams; ++i) {
+    const std::string text = ReadSetting(kParameterSettingKeys[i], L"Parameters");
+    double value = 0.0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    const IParam* param = GetParam(i);
+    if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
+        && std::isfinite(value) && value >= param->GetMin() && value <= param->GetMax())
+      GetParam(i)->Set(value);
+  }
 }
 
 void RVCRealtime::SaveUserConfiguration() const

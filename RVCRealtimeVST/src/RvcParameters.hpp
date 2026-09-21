@@ -17,6 +17,8 @@ enum ParameterId : uint32_t {
     kParamF0Method,
     kParamDryWet,
     kParamOutputGain,
+    kParamGpuPriority,
+    kParamMaxLatencyMs,
     kParamStatus,
     kParamInferMs,
     kParamDroppedBlocks,

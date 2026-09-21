@@ -94,7 +94,7 @@ int main(int argc, char** argv)
     effect->dispatcher(effect, effClose, 0, 0, nullptr, 0.0f);
     FreeLibrary(module);
 
-    if (inputsCount != 2 || outputsCount != 2 || paramsCount != 12 || maxError > 1e-6f) {
+    if (inputsCount != 2 || outputsCount != 2 || paramsCount != 14 || maxError > 1e-6f) {
         std::cerr << "Unexpected VST2 behavior: inputs=" << inputsCount
                   << " outputs=" << outputsCount << " params=" << paramsCount
                   << " max_error=" << maxError << '\n';

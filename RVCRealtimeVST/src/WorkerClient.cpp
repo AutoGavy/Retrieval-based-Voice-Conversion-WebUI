@@ -1,4 +1,5 @@
 #include "WorkerClient.hpp"
+#include "RealtimePolicy.hpp"
 #include "config.h"
 
 #if !defined(_WIN32)
@@ -6,6 +7,7 @@
 #endif
 
 #include <windows.h>
+#include <d3dkmthk.h>
 
 #include <algorithm>
 #include <chrono>
@@ -18,7 +20,8 @@ namespace rvc {
 namespace {
 
 constexpr uint32_t kMagic = 0x50564352; // RVCP
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2;
+constexpr uint32_t kResetOffset = 68;
 constexpr uint32_t kHeaderBytes = 4096;
 constexpr uint32_t kMaxFrames = 131072;
 constexpr uint32_t kMapBytes = kHeaderBytes + kMaxFrames * sizeof(float) * 2;
@@ -181,6 +184,9 @@ struct WorkerClient::Ipc {
     std::string responseName;
     std::string configPath;
     uint32_t sequence = 0;
+    int requestedGpuPriority = -1;
+    bool haveOriginalGpuPriority = false;
+    D3DKMT_SCHEDULINGPRIORITYCLASS originalGpuPriority = D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL;
 
     ~Ipc()
     {
@@ -210,6 +216,8 @@ WorkerClient::WorkerClient()
     parameters_[kParamCrossfadeMs].store(80.0f);
     parameters_[kParamExtraMs].store(2000.0f);
     parameters_[kParamF0Method].store(0.0f);
+    parameters_[kParamGpuPriority].store(1.0f);
+    parameters_[kParamMaxLatencyMs].store(kDefaultMaxLatencyMs);
 
     paths_.model = RVC_DEFAULT_MODEL;
     paths_.index = RVC_DEFAULT_INDEX;
@@ -242,9 +250,11 @@ void WorkerClient::setSampleRate(const double sampleRate) noexcept
 
 void WorkerClient::setParameter(const ParameterId id, const float value) noexcept
 {
-    if (id >= kParameterCount)
+    if (id >= kParameterCount || !std::isfinite(value))
         return;
-    const float old = parameters_[id].exchange(value, std::memory_order_relaxed);
+    const float bounded = id == kParamMaxLatencyMs
+        ? std::clamp(value, kMinMaxLatencyMs, kMaxMaxLatencyMs) : value;
+    const float old = parameters_[id].exchange(bounded, std::memory_order_relaxed);
     if ((id == kParamBlockMs || id == kParamCrossfadeMs || id == kParamExtraMs) && std::abs(old - value) > 0.01f)
         configVersion_.fetch_add(1, std::memory_order_release);
 }
@@ -268,9 +278,13 @@ std::size_t WorkerClient::pushInput(const float* const samples, const std::size_
 {
     if (!isReady())
         return 0;
-    const std::size_t pushed = inputRing_.push(samples, count);
-    if (pushed != count)
-        droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
+    // One timestamp per host callback: age starts at plugin entry, not at
+    // inference submission/completion. No allocation or locks on the audio path.
+    const std::size_t pushed = inputRing_.push(samples, count, nullptr, realtimeSeconds());
+    if (pushed != count) {
+        countDroppedSamples(count - pushed);
+        inputOverflow_.store(true, std::memory_order_release);
+    }
     return pushed;
 }
 
@@ -278,13 +292,91 @@ std::size_t WorkerClient::popOutput(float* const samples, const std::size_t coun
 {
     if (!isReady())
         return 0;
+    countDroppedSamples(outputRing_.discardBefore(discardOutputBefore_.load(std::memory_order_acquire)));
+    const double now = realtimeSeconds();
+    countDroppedSamples(outputRing_.discardExpired(now - maxLatencySeconds()));
+    const double enteredAt = outputRing_.oldestTimestamp();
+    audioAgeMs_.store(enteredAt > 0.0 ? static_cast<float>(std::max(0.0, now - enteredAt) * 1000.0) : 0.0f,
+                      std::memory_order_relaxed);
     return outputRing_.pop(samples, count);
+}
+
+double WorkerClient::maxLatencySeconds() const noexcept
+{
+    return parameters_[kParamMaxLatencyMs].load(std::memory_order_relaxed) / 1000.0;
+}
+
+void WorkerClient::countDroppedSamples(const std::size_t samples) noexcept
+{
+    if (samples == 0)
+        return;
+    const auto frames = std::max<uint32_t>(1, blockFrames_.load(std::memory_order_relaxed));
+    droppedBlocks_.fetch_add(static_cast<uint32_t>((samples + frames - 1) / frames), std::memory_order_relaxed);
+}
+
+void WorkerClient::markDiscontinuity() noexcept
+{
+    resetStream_ = true;
+    // Only the audio consumer advances outputRing_'s read pointer. Samples
+    // published after this boundary must survive the flush.
+    discardOutputBefore_.store(outputRing_.writePosition(), std::memory_order_release);
 }
 
 std::string WorkerClient::statusText() const
 {
     std::lock_guard<std::mutex> lock(statusTextMutex_);
     return statusText_;
+}
+
+std::string WorkerClient::gpuPriorityText() const
+{
+    std::lock_guard<std::mutex> lock(statusTextMutex_);
+    return gpuPriorityText_;
+}
+
+void WorkerClient::updateGpuPriority()
+{
+    if (!ipc_ || !ipc_->process)
+        return;
+    const int requested = parameters_[kParamGpuPriority].load(std::memory_order_relaxed) >= 0.5f ? 1 : 0;
+    if (ipc_->requestedGpuPriority == requested)
+        return;
+    ipc_->requestedGpuPriority = requested;
+    auto report = [this](const std::string& text) {
+        std::lock_guard<std::mutex> lock(statusTextMutex_);
+        gpuPriorityText_ = text;
+    };
+    // Resolve optionally, from System32 only. Unsupported/denied requests are
+    // visible but never make the audio engine fail or trigger elevation.
+    const HMODULE gdi = LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto setPriority = gdi ? reinterpret_cast<decltype(&D3DKMTSetProcessSchedulingPriorityClass)>(
+        GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass")) : nullptr;
+    const auto getPriority = gdi ? reinterpret_cast<decltype(&D3DKMTGetProcessSchedulingPriorityClass)>(
+        GetProcAddress(gdi, "D3DKMTGetProcessSchedulingPriorityClass")) : nullptr;
+    if (!setPriority || !getPriority) {
+        if (gdi) FreeLibrary(gdi);
+        report("GPU priority: API unavailable");
+        return;
+    }
+    LONG result = 0;
+    if (!ipc_->haveOriginalGpuPriority) {
+        result = getPriority(ipc_->process, &ipc_->originalGpuPriority);
+        ipc_->haveOriginalGpuPriority = result >= 0;
+    }
+    auto actual = ipc_->originalGpuPriority;
+    const auto target = requested ? D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH : ipc_->originalGpuPriority;
+    if (result >= 0) result = setPriority(ipc_->process, target);
+    if (result >= 0) result = getPriority(ipc_->process, &actual);
+    FreeLibrary(gdi);
+    if (result < 0) {
+        std::ostringstream message;
+        message << "GPU priority: request/readback failed (0x" << std::hex << static_cast<uint32_t>(result) << ")";
+        report(message.str());
+    } else if (actual != target) {
+        report("GPU priority: requested class not confirmed");
+    } else {
+        report(requested ? "GPU priority: HIGH accepted (best effort)" : "GPU priority: OFF (original restored)");
+    }
 }
 
 WorkerClient::Paths WorkerClient::pathsSnapshot() const
@@ -438,6 +530,10 @@ bool WorkerClient::launchWorker(const Paths& paths, const uint64_t)
     }
     ipc_->process = process.hProcess;
     ipc_->processThread = process.hThread;
+    {
+        std::lock_guard<std::mutex> lock(statusTextMutex_);
+        gpuPriorityText_ = "GPU priority: pending worker initialization";
+    }
     setStatus(kStatusLoading, "Loading RVC model");
     return true;
 }
@@ -454,6 +550,11 @@ void WorkerClient::stopWorker()
             TerminateProcess(ipc_->process, 0);
     }
     ipc_.reset();
+    audioAgeMs_.store(0.0f, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(statusTextMutex_);
+        gpuPriorityText_ = "GPU priority: no active worker";
+    }
 }
 
 bool WorkerClient::processOneBlock()
@@ -461,13 +562,25 @@ bool WorkerClient::processOneBlock()
     if (!ipc_ || !ipc_->view)
         return false;
     const uint32_t frames = blockFrames_.load(std::memory_order_relaxed);
+    if (inputOverflow_.exchange(false, std::memory_order_acq_rel)) {
+        // A full input ring rejected recent audio: its tail is no longer live.
+        countDroppedSamples(inputRing_.discard(inputRing_.readable()));
+        markDiscontinuity();
+        return true;
+    }
+    const auto discarded = trimStaleAudio(inputRing_, frames, realtimeSeconds() - maxLatencySeconds());
+    if (discarded != 0) {
+        countDroppedSamples(discarded);
+        markDiscontinuity();
+    }
     if (inputRing_.readable() < frames)
         return true;
     if (requestBuffer_.size() < frames) {
         requestBuffer_.resize(frames);
         responseBuffer_.resize(frames);
+        requestTimes_.resize(frames);
     }
-    if (inputRing_.pop(requestBuffer_.data(), frames) != frames)
+    if (inputRing_.pop(requestBuffer_.data(), frames, requestTimes_.data()) != frames)
         return true;
 
     const uint32_t sequence = ++ipc_->sequence;
@@ -480,6 +593,8 @@ bool WorkerClient::processOneBlock()
     writeAt<float>(ipc_->view, 44, parameters_[kParamRmsMix].load(std::memory_order_relaxed));
     writeAt<float>(ipc_->view, 48, parameters_[kParamThreshold].load(std::memory_order_relaxed));
     writeAt<uint32_t>(ipc_->view, 64, static_cast<uint32_t>(std::round(parameters_[kParamF0Method].load(std::memory_order_relaxed))));
+    writeAt<uint32_t>(ipc_->view, kResetOffset, resetStream_ ? 1u : 0u);
+    resetStream_ = false;
     std::memcpy(static_cast<unsigned char*>(ipc_->view) + kInputOffset, requestBuffer_.data(), frames * sizeof(float));
     SetEvent(ipc_->requestEvent);
 
@@ -491,7 +606,8 @@ bool WorkerClient::processOneBlock()
     }
     if (readAt<uint32_t>(ipc_->view, 16) != sequence) {
         droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        setStatus(kStatusError, "RVC response sequence mismatch");
+        return false;
     }
 
     const int workerState = readAt<int32_t>(ipc_->view, 8);
@@ -502,9 +618,17 @@ bool WorkerClient::processOneBlock()
     }
 
     inferMs_.store(readAt<float>(ipc_->view, 56), std::memory_order_relaxed);
+    if (responseExpired(requestTimes_.front(), realtimeSeconds(), maxLatencySeconds())
+        || inputOverflow_.load(std::memory_order_acquire)) {
+        countDroppedSamples(frames);
+        markDiscontinuity();
+        return true;
+    }
     std::memcpy(responseBuffer_.data(), static_cast<unsigned char*>(ipc_->view) + kOutputOffset, frames * sizeof(float));
-    if (outputRing_.push(responseBuffer_.data(), frames) != frames)
-        droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
+    if (outputRing_.push(responseBuffer_.data(), frames, requestTimes_.data()) != frames) {
+        countDroppedSamples(frames);
+        markDiscontinuity();
+    }
     return true;
 }
 
@@ -518,6 +642,10 @@ void WorkerClient::threadMain()
             if (ipc_)
                 stopWorker();
             setStatus(kStatusOff, "Off");
+            {
+                std::lock_guard<std::mutex> lock(statusTextMutex_);
+                gpuPriorityText_ = "GPU priority: engine off";
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             continue;
         }
@@ -535,6 +663,7 @@ void WorkerClient::threadMain()
             latencyFrames_.store(blockFrames_.load() * 2, std::memory_order_relaxed);
             droppedBlocks_.store(0, std::memory_order_relaxed);
             inferMs_.store(0.0f, std::memory_order_relaxed);
+            audioAgeMs_.store(0.0f, std::memory_order_relaxed);
             if (!launchWorker(paths, activeVersion)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
@@ -545,9 +674,12 @@ void WorkerClient::threadMain()
             const int workerState = readAt<int32_t>(ipc_->view, 8);
             const char* const workerText = reinterpret_cast<const char*>(static_cast<unsigned char*>(ipc_->view) + kStatusTextOffset);
             if (workerState == kStatusReady) {
-                inputRing_.resetUnsafe();
-                outputRing_.resetUnsafe();
-                outputRing_.pushZeros(latencyFrames_.load(std::memory_order_relaxed));
+                // Keep monotonic cursors: an audio callback may still be
+                // finishing when ready_ changes. Only consumers may discard.
+                inputRing_.discard(inputRing_.readable());
+                inputOverflow_.store(false, std::memory_order_release);
+                markDiscontinuity();
+                outputRing_.pushZeros(latencyFrames_.load(std::memory_order_relaxed), realtimeSeconds());
                 setStatus(kStatusReady, workerText[0] != '\0' ? workerText : "Ready");
                 ready_.store(true, std::memory_order_release);
             } else if (workerState < 0) {
@@ -572,6 +704,7 @@ void WorkerClient::threadMain()
             continue;
         }
 
+        updateGpuPriority();
         if (!processOneBlock()) {
             ready_.store(false, std::memory_order_release);
             stopWorker();

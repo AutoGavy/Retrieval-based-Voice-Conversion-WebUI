@@ -14,7 +14,8 @@ import traceback
 from pathlib import Path
 
 MAGIC = 0x50564352
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+RESET_OFFSET = 68
 HEADER_BYTES = 4096
 MAX_FRAMES = 131072
 MAP_BYTES = HEADER_BYTES + MAX_FRAMES * 4 * 2
@@ -160,6 +161,10 @@ class RVCStreamEngine:
         if self.torch.device(self.config.device).type == "cuda":
             self.torch.cuda.synchronize(self.config.device)
 
+        self.reset_stream()
+
+    def reset_stream(self) -> None:
+        """Forget discontinuous history in place, preserving CUDA graph buffers."""
         self.input_wav.zero_()
         self.input_wav_res.zero_()
         self.rms_buffer.fill(0.0)
@@ -168,6 +173,22 @@ class RVCStreamEngine:
             self.rvc.cache_pitch.zero_()
         if hasattr(self.rvc, "cache_pitchf"):
             self.rvc.cache_pitchf.zero_()
+        self.last_pitch = None
+        self.last_formant = None
+        self.last_index_rate = None
+
+    def process_request(self, shared, audio):
+        if read_value(shared, RESET_OFFSET, "I") & 1:
+            self.reset_stream()
+        return self.process(
+            audio,
+            read_value(shared, 32, "f"),
+            read_value(shared, 36, "f"),
+            read_value(shared, 40, "f"),
+            read_value(shared, 44, "f"),
+            read_value(shared, 48, "f"),
+            read_value(shared, 64, "I"),
+        )
 
     def process(self, audio, pitch: float, formant: float, index_rate: float,
                 rms_mix: float, threshold: float, f0_method: int):
@@ -293,15 +314,7 @@ def run(args: argparse.Namespace) -> int:
             if frames <= 0 or frames > MAX_FRAMES:
                 raise ValueError(f"invalid frame count: {frames}")
             started = time.perf_counter()
-            processed = engine.process(
-                input_view[:frames],
-                read_value(shared, 32, "f"),
-                read_value(shared, 36, "f"),
-                read_value(shared, 40, "f"),
-                read_value(shared, 44, "f"),
-                read_value(shared, 48, "f"),
-                read_value(shared, 64, "I"),
-            )
+            processed = engine.process_request(shared, input_view[:frames])
             output_view[:frames] = processed
             write_value(shared, 56, "f", (time.perf_counter() - started) * 1000.0)
             write_value(shared, 16, "I", sequence)

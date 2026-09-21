@@ -33,10 +33,12 @@ public:
     bool isReady() const noexcept { return ready_.load(std::memory_order_acquire); }
     int status() const noexcept { return status_.load(std::memory_order_acquire); }
     float inferMs() const noexcept { return inferMs_.load(std::memory_order_relaxed); }
+    float audioAgeMs() const noexcept { return audioAgeMs_.load(std::memory_order_relaxed); }
     float droppedBlocks() const noexcept { return static_cast<float>(droppedBlocks_.load(std::memory_order_relaxed)); }
     uint32_t blockFrames() const noexcept { return blockFrames_.load(std::memory_order_relaxed); }
     uint32_t latencyFrames() const noexcept { return latencyFrames_.load(std::memory_order_relaxed); }
     std::string statusText() const;
+    std::string gpuPriorityText() const;
 
 private:
     struct Paths {
@@ -52,14 +54,21 @@ private:
     bool launchWorker(const Paths& paths, uint64_t version);
     void stopWorker();
     bool processOneBlock();
+    void markDiscontinuity() noexcept;
+    void countDroppedSamples(std::size_t samples) noexcept;
+    void updateGpuPriority(); // Worker thread only; never changes host/other processes.
+    double maxLatencySeconds() const noexcept;
     Paths pathsSnapshot() const;
     void setStatus(int status, const std::string& text);
     uint32_t calculateBlockFrames() const noexcept;
     std::string writeWorkerConfig(const Paths& paths, std::string& error) const;
 
     static constexpr std::size_t kRingCapacity = 1u << 20;
-    SpscFloatRing inputRing_ {kRingCapacity};
-    SpscFloatRing outputRing_ {kRingCapacity};
+    SpscFloatRing inputRing_ {kRingCapacity, true};
+    SpscFloatRing outputRing_ {kRingCapacity, true};
+    std::atomic<std::size_t> discardOutputBefore_ {0};
+    std::atomic<bool> inputOverflow_ {false};
+    bool resetStream_ = true; // Worker thread only; sent with the next request.
 
     std::array<std::atomic<float>, kParameterCount> parameters_ {};
     std::atomic<bool> enabled_ {false};
@@ -67,6 +76,7 @@ private:
     std::atomic<bool> ready_ {false};
     std::atomic<int> status_ {kStatusOff};
     std::atomic<float> inferMs_ {0.0f};
+    std::atomic<float> audioAgeMs_ {0.0f};
     std::atomic<uint32_t> droppedBlocks_ {0};
     std::atomic<uint32_t> blockFrames_ {6240};
     std::atomic<uint32_t> latencyFrames_ {12480};
@@ -77,10 +87,12 @@ private:
     Paths paths_;
     mutable std::mutex statusTextMutex_;
     std::string statusText_ {"Off"};
+    std::string gpuPriorityText_ {"GPU priority: pending"};
 
     std::unique_ptr<Ipc> ipc_;
     std::vector<float> requestBuffer_;
     std::vector<float> responseBuffer_;
+    std::vector<double> requestTimes_;
     std::thread thread_;
 };
 

@@ -2,8 +2,8 @@
 
 #define PLUG_NAME "RVC Realtime"
 #define PLUG_MFR "RVC Project"
-#define PLUG_VERSION_HEX 0x00010000
-#define PLUG_VERSION_STR "0.1.0"
+#define PLUG_VERSION_HEX 0x00010004
+#define PLUG_VERSION_STR "0.1.4"
 #define PLUG_UNIQUE_ID 'Rvcr'
 #define PLUG_MFR_ID 'Rvcp'
 #define PLUG_URL_STR "https://github.com/iPlug2/iPlug2"
@@ -25,7 +25,7 @@
 #define PLUG_DOES_STATE_CHUNKS 1
 #define PLUG_HAS_UI 1
 #define PLUG_WIDTH 780
-#define PLUG_HEIGHT 630
+#define PLUG_HEIGHT 704
 #define PLUG_FPS 30
 #define PLUG_SHARED_RESOURCES 0
 #define PLUG_HOST_RESIZE 1

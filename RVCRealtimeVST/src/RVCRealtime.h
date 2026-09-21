@@ -6,6 +6,8 @@
 #include "WorkerClient.hpp"
 
 #include <atomic>
+#include <array>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -25,6 +27,8 @@ enum EParams {
   kF0Method,
   kDryWet,
   kOutputGain,
+  kGpuPriority,
+  kMaxLatencyMs,
   kNumParams
 };
 
@@ -35,7 +39,9 @@ enum EControlTags {
   kCtrlRvcRoot,
   kCtrlPythonPath,
   kCtrlModelName,
-  kCtrlIndexName
+  kCtrlIndexName,
+  kCtrlGpuPriority,
+  kCtrlLatencyHint
 };
 
 using namespace iplug;
@@ -44,6 +50,7 @@ using namespace igraphics;
 class RVCRealtime final : public Plugin {
 public:
   RVCRealtime(const InstanceInfo& info);
+  ~RVCRealtime() override;
 
 #if IPLUG_DSP
   void ProcessBlock(sample** inputs, sample** outputs, int nFrames) override;
@@ -53,6 +60,8 @@ public:
 
   void OnIdle() override;
   void OnUIOpen() override;
+  void OnUIClose() override;
+  void OnParamChangeUI(int paramIdx, EParamSource source = kUnknown) override;
   bool SerializeState(IByteChunk& chunk) const override;
   int UnserializeState(const IByteChunk& chunk, int startPos) override;
 
@@ -73,6 +82,7 @@ private:
   bool ValidateConfiguration(std::string& error) const;
   void LoadUserConfiguration();
   void SaveUserConfiguration() const;
+  void FlushParameterSettings(bool force = false);
 
   rvc::WorkerClient mWorker;
   std::vector<float> mMonoInput;
@@ -90,6 +100,13 @@ private:
   WDL_String mModelBrowseDirectory;
   WDL_String mIndexBrowseDirectory;
   WDL_String mValidationMessage;
+
+  // Only UI/idle/teardown callbacks access these. Capture edited values now:
+  // a later host preset recall must not replace an edit waiting to be saved.
+  std::array<double, kNumParams> mPendingParameterValues {};
+  uint32_t mPendingParameterMask = 0;
+  std::chrono::steady_clock::time_point mParameterSaveDue {};
+  bool mParameterSaveFailed = false;
 
   RVCRealtime(const RVCRealtime&) = delete;
   RVCRealtime& operator=(const RVCRealtime&) = delete;

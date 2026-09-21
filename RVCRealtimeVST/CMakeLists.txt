@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-project(RVCRealtime VERSION 0.1.0 LANGUAGES C CXX RC)
+project(RVCRealtime VERSION 0.1.4 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +27,7 @@ iplug_add_plugin(${PROJECT_NAME}
         src/WorkerClient.cpp
         src/WorkerClient.hpp
         src/SpscRing.hpp
+        src/RealtimePolicy.hpp
         src/RvcParameters.hpp
         config.h
         resources/resource.h
@@ -62,6 +63,7 @@ if(RVC_BUILD_SMOKE_TEST)
         src/WorkerClient.cpp
         src/WorkerClient.hpp
         src/SpscRing.hpp
+        src/RealtimePolicy.hpp
         src/RvcParameters.hpp
         config.h)
     target_include_directories(rvc-worker-smoke PRIVATE

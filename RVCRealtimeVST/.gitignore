@@ -1,6 +1,6 @@
-/build/
-/build-*/
-/dist/
+/build*/
+/dist*/
+**/__pycache__/
 /logs/
 /tools/vst3-validator-build/
 *.aps
